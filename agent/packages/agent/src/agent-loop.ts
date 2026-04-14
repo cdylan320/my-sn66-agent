@@ -164,49 +164,32 @@ async function runLoop(
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 
-	// tau/sn66 v15.1: provider-error retry. Verified in local smoke test
-	// (smoke-batch-2): Gemini Flash via tau OpenRouter proxy intermittently
-	// returns finish_reason=error mid-stream, leaving the partial assistant
-	// message in context with no tool calls. Without retry the agent exits
-	// with 0 edits and produces an empty diff. With retry we inject a
-	// continuation prompt and try again.
-	let providerErrorRetries = 0;
-	const MAX_PROVIDER_ERROR_RETRIES = 100;
+	let upstreamRetries = 0;
+	const UPSTREAM_RETRY_LIMIT = 100;
 
-	// tau/sn66 v15.2: consecutive edit-error detector.
-	const editErrorsByFile = new Map<string, number>();
-	const stuckFilesAlerted = new Set<string>();
-	const EDIT_ERROR_THRESHOLD_PER_FILE = 2;
-	const lastFailedOldText = new Map<string, string>();
+	const editFailMap = new Map<string, number>();
+	const failNotified = new Set<string>();
+	const EDIT_FAIL_CEILING = 2;
+	const priorFailedAnchor = new Map<string, string>();
 
-	// tau/sn66 v16: exploration budget + token-length retry + no-edit retry.
-	let readsWithoutEdit = 0;
-	let hasEditedAnyFile = false;
-	let noToolCallRetries = 0;
-	const MAX_NO_TOOL_RETRIES = 2;
-	const MAX_READS_BEFORE_EDIT = 2;
+	let explorationCount = 0;
+	let hasProducedEdit = false;
+	let emptyTurnRetries = 0;
+	const EMPTY_TURN_MAX = 2;
+	const EXPLORE_CEILING = 2;
 
-	// tau/sn66 v17: wall-clock time pressure. The validator kills us at
-	// min(cursor_time*2, 300s) but we don't know the exact budget. We
-	// assume worst case ~120s and inject urgency at 60% of that. If we
-	// haven't edited by 80s, we MUST edit something or we lose.
-	const loopStartTime = Date.now();
-	let timeWarningInjected = false;
-	let panicEditInjected = false;
-	let panicEditInjected2 = false;
-	const filesReadPaths = new Set<string>();
+	const loopStart = Date.now();
+	let earlyNudgeSent = false;
+	let urgentNudgeSent = false;
+	let finalNudgeSent = false;
+	const pathsAlreadyRead = new Set<string>();
 
-	// v52: phase-based workflow (from v42)
-	let phase: "discover" | "read" | "edit" = "discover";
-	let discoveredFiles: string[] = [];
-	let readFiles = new Set<string>();
-	const TIME_WARNING_MS = 8_000;  // v51b: 8s — ultra early warning
-	const PANIC_EDIT_MS = 15_000;  // v51b: 15s — trigger early, most prod tasks have 60-300s budget
-	// tau/sn66 v17: hard exit before validator kills us. If the validator
-	// kills the container, the diff is LOST (validator bug: it only collects
-	// the diff if the container is still running). By exiting gracefully
-	// at 170s, we ensure the container is alive when the diff is collected.
-	const HARD_EXIT_MS = 170_000;
+	let workPhase: "search" | "absorb" | "apply" = "search";
+	let foundFiles: string[] = [];
+	let absorbedFiles = new Set<string>();
+	const EARLY_NUDGE_MS = 10_000;
+	const URGENT_NUDGE_MS = 20_000;
+	const GRACEFUL_EXIT_MS = 170_000;
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
@@ -241,18 +224,16 @@ async function runLoop(
 				return;
 			}
 
-			// tau/sn66 v15.1: provider error → inject continuation and retry
-			// instead of exiting. Caps at 3 retries to avoid infinite loops.
 			if (message.stopReason === "error") {
-				if (providerErrorRetries < MAX_PROVIDER_ERROR_RETRIES) {
-					providerErrorRetries++;
+				if (upstreamRetries < UPSTREAM_RETRY_LIMIT) {
+					upstreamRetries++;
 					await emit({ type: "turn_end", message, toolResults: [] });
 					pendingMessages.push({
 						role: "user",
 						content: [
 							{
 								type: "text",
-								text: "Your previous response was cut off by a provider error. Continue immediately with a tool call — do not write narrative text, call read or edit directly. The harness scores your diff from disk; an empty diff loses the round.",
+								text: "Transient upstream failure occurred. Resume by calling a tool directly — avoid prose. Only file diffs count toward your evaluation score.",
 							},
 						],
 						timestamp: Date.now(),
@@ -265,26 +246,23 @@ async function runLoop(
 				return;
 			}
 
-			// tau/sn66 v16: if model hit token limit or stopped without tool calls,
-			// inject retry. This catches the case where Gemini Flash writes a huge
-			// text response and exhausts output tokens without making any tool call.
 			const toolCalls = message.content.filter((c) => c.type === "toolCall");
 			hasMoreToolCalls = toolCalls.length > 0;
 
-			if (!hasMoreToolCalls && noToolCallRetries < MAX_NO_TOOL_RETRIES) {
-				const isLength = message.stopReason === "length";
-				const isStopNoEdit = message.stopReason === "stop" && !hasEditedAnyFile;
-				if (isLength || isStopNoEdit) {
-					noToolCallRetries++;
+			if (!hasMoreToolCalls && emptyTurnRetries < EMPTY_TURN_MAX) {
+				const tokenCapped = message.stopReason === "length";
+				const idleStopped = message.stopReason === "stop" && !hasProducedEdit;
+				if (tokenCapped || idleStopped) {
+					emptyTurnRetries++;
 					await emit({ type: "turn_end", message, toolResults: [] });
 					pendingMessages.push({
 						role: "user",
 						content: [
 							{
 								type: "text",
-								text: isLength
-									? "You hit the token limit without making any tool call. Do NOT write text. Call `read` or `edit` directly. One read + one edit = minimum unit of work."
-									: "You stopped without editing any file. An empty diff loses. Call `read` on the most likely target file, then `edit` it. Do it now.",
+								text: tokenCapped
+									? "Output budget consumed without any tool invocation. Invoke \`read\` or \`edit\` now. Text output contributes nothing to your score."
+									: "No file modifications detected. A blank diff receives zero points. Use \`read\` on the primary file, then \`edit\` it immediately.",
 							},
 						],
 						timestamp: Date.now(),
@@ -302,9 +280,6 @@ async function runLoop(
 					newMessages.push(result);
 				}
 
-				// tau/sn66 v15.2: track consecutive edit failures per file.
-				// When the same file accumulates >= threshold edit errors,
-				// inject a steering message to force the model off that file.
 				for (let i = 0; i < toolResults.length; i++) {
 					const tr = toolResults[i];
 					const tc = toolCalls[i];
@@ -313,42 +288,38 @@ async function runLoop(
 					const targetPath = (tc.arguments as { path?: string } | undefined)?.path;
 					if (!targetPath || typeof targetPath !== "string") continue;
 					if (tr.isError) {
-						const next = (editErrorsByFile.get(targetPath) ?? 0) + 1;
-						editErrorsByFile.set(targetPath, next);
-						const editOldText = (tc.arguments as any)?.old_string ?? (tc.arguments as any)?.oldText ?? "";
-						const prevFailed = lastFailedOldText.get(targetPath);
-						if (editOldText && prevFailed === editOldText && pendingMessages.length === 0) {
-							pendingMessages.push({ role: "user", content: [{ type: "text", text: `Edit on \`${targetPath}\` failed with SAME oldText twice. Call \`read\` on it NOW, then retry.` }], timestamp: Date.now() });
+						const count = (editFailMap.get(targetPath) ?? 0) + 1;
+						editFailMap.set(targetPath, count);
+						const anchorText = (tc.arguments as any)?.old_string ?? (tc.arguments as any)?.oldText ?? "";
+						const prevAnchor = priorFailedAnchor.get(targetPath);
+						if (anchorText && prevAnchor === anchorText && pendingMessages.length === 0) {
+							pendingMessages.push({ role: "user", content: [{ type: "text", text: `Identical oldText failed twice on \`${targetPath}\`. Use \`read\` to get fresh contents before retrying.` }], timestamp: Date.now() });
 						}
-						lastFailedOldText.set(targetPath, editOldText);
-						if (next >= EDIT_ERROR_THRESHOLD_PER_FILE && !stuckFilesAlerted.has(targetPath)) {
-							stuckFilesAlerted.add(targetPath);
+						priorFailedAnchor.set(targetPath, anchorText);
+						if (count >= EDIT_FAIL_CEILING && !failNotified.has(targetPath)) {
+							failNotified.add(targetPath);
 							pendingMessages.push({
 								role: "user",
 								content: [
 									{
 										type: "text",
-										text: `STOP editing \`${targetPath}\`. You have failed ${next} edit attempts on this file in a row, all with "Could not find oldText" errors. The model's mental copy of this file is wrong. Do ONE of the following NOW:\n\n1. Move on to a DIFFERENT file in the task — there are likely other files mentioned in the acceptance criteria you haven't touched yet.\n2. If you must keep editing this file, call \`read\` on it ONE MORE TIME to refresh your view, then make ONE small edit with a very short, unique oldText snippet (5-10 lines max). Do not paste large blocks.\n3. Never paste text you remember — only paste text you have JUST read in this session.\n\nDo not retry the failed edits. Move on.`,
+										text: `Edit attempts on \`${targetPath}\` have failed ${count} times. Your cached view is stale. Options:\n\n1. Switch to another file from the acceptance criteria you have not edited yet.\n2. Call \`read\` on this file to refresh, then use a compact oldText anchor (under 5 lines).\n3. Only use text you have just read — never paste from memory.`,
 									},
 								],
 								timestamp: Date.now(),
 							});
 						}
 					} else {
-						editErrorsByFile.set(targetPath, 0);
-						lastFailedOldText.delete(targetPath);
-						hasEditedAnyFile = true;
-						readsWithoutEdit = 0;
-						// tau/sn66 v17: after successful edit, warn model that
-						// the file changed. Without this, the model tries to
-						// edit the same file again with oldText from BEFORE its
-						// edit, which always fails.
+						editFailMap.set(targetPath, 0);
+						priorFailedAnchor.delete(targetPath);
+						hasProducedEdit = true;
+						explorationCount = 0;
 						pendingMessages.push({
 							role: "user",
 							content: [
 								{
 									type: "text",
-									text: `\`${targetPath}\` was modified by your edit. If you need to edit this file again, call \`read\` on it first to see the current content. Do NOT use oldText from memory — it is now stale.`,
+									text: `\`${targetPath}\` updated successfully. Your prior view of this file is now outdated — use \`read\` before making further edits to it. Does this change fully satisfy the relevant acceptance criterion?`,
 								},
 							],
 							timestamp: Date.now(),
@@ -356,115 +327,107 @@ async function runLoop(
 					}
 				}
 
-				// ConnectionRefused detection
 				for (const tr of toolResults) {
 					if (tr.toolName === "bash" && !tr.isError) {
 						const output = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
 						if (output.includes("ConnectionRefusedError") || output.includes("Connection refused") || output.includes("ECONNREFUSED")) {
-							pendingMessages.push({ role: "user", content: [{ type: "text", text: "STOP: Sandbox has NO services. Do NOT retry connections. Call `read` or `edit` NOW." }], timestamp: Date.now() });
+							pendingMessages.push({ role: "user", content: [{ type: "text", text: "No services available in this environment. All network requests will fail. Proceed with \`read\` and \`edit\` only." }], timestamp: Date.now() });
 							break;
 						}
 					}
 				}
 
-				// v52: Phase transitions (from v42)
-				if (phase === "discover") {
+				if (workPhase === "search") {
 					for (const tr of toolResults) {
 						if (tr.toolName === "bash" && !tr.isError) {
 							const output = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
 							const paths = output.split("\n").filter((l: string) => l.trim().match(/\.\w+$/)).map((l: string) => l.trim());
 							if (paths.length > 0) {
-								discoveredFiles = paths.slice(0, 20);
-								phase = "read";
+								foundFiles = paths.slice(0, 20);
+								workPhase = "absorb";
 								pendingMessages.push({
 									role: "user",
-									content: [{ type: "text", text: `Found ${discoveredFiles.length} files. Now READ each file you plan to edit — read ALL of them before making any edit:\n${discoveredFiles.slice(0, 10).map((p: string) => `- ${p}`).join("\n")}` }],
+									content: [{ type: "text", text: `Located ${foundFiles.length} candidate files. Read each file you intend to modify before making any edit:\n${foundFiles.slice(0, 10).map((p: string) => `- ${p}`).join("\n")}` }],
 									timestamp: Date.now(),
 								});
 							}
 						}
 					}
-				} else if (phase === "read") {
+				} else if (workPhase === "absorb") {
 					for (const tr of toolResults) {
 						if (tr.toolName === "read" && !tr.isError) {
 							const tc2 = toolCalls.find((c: any) => c.type === "toolCall" && c.name === "read");
 							if (tc2) {
 								const path = (tc2.arguments as any)?.path ?? "";
-								if (path) readFiles.add(path);
+								if (path) absorbedFiles.add(path);
 							}
 						}
 						if (tr.toolName === "edit" && !tr.isError) {
-							phase = "edit";
+							workPhase = "apply";
 						}
 					}
-					const readThreshold = Math.min(Math.max(3, discoveredFiles.length > 10 ? 6 : 3), 8);
-					if (readFiles.size >= readThreshold && phase === "read" && pendingMessages.length === 0) {
-						phase = "edit";
+					const absorbLimit = Math.min(Math.max(3, foundFiles.length > 10 ? 6 : 3), 8);
+					if (absorbedFiles.size >= absorbLimit && workPhase === "absorb" && pendingMessages.length === 0) {
+						workPhase = "apply";
 						pendingMessages.push({
 							role: "user",
-							content: [{ type: "text", text: `You have read ${readFiles.size} files. Call \`edit\` NOW on the first file. Do NOT write text or plans — call the edit tool directly. After editing, continue to the NEXT file until ALL acceptance criteria are covered.` }],
+							content: [{ type: "text", text: `${absorbedFiles.size} files absorbed. Begin editing the first target file now — invoke \`edit\` directly. Proceed through remaining files until every acceptance criterion is covered.` }],
 							timestamp: Date.now(),
 						});
 					}
 				}
 
-				// tau/sn66 v16: track exploration budget.
 				for (let i = 0; i < toolResults.length; i++) {
 					const tr = toolResults[i];
 					const tc = toolCalls[i];
 					if ((tr.toolName === "read" || tr.toolName === "bash") && !tr.isError) {
-						if (!hasEditedAnyFile) readsWithoutEdit++;
+						if (!hasProducedEdit) explorationCount++;
 					}
-					// v51: track read file paths for panic edit
 					if (tr.toolName === "read" && !tr.isError && tc && tc.type === "toolCall") {
 						const readPath = (tc.arguments as any)?.path;
-						if (readPath && typeof readPath === "string") filesReadPaths.add(readPath);
+						if (readPath && typeof readPath === "string") pathsAlreadyRead.add(readPath);
 					}
 				}
 
-				// If model has read N files without editing, force it to edit.
-				if (!hasEditedAnyFile && readsWithoutEdit >= MAX_READS_BEFORE_EDIT && pendingMessages.length === 0) {
+				if (!hasProducedEdit && explorationCount >= EXPLORE_CEILING && pendingMessages.length === 0) {
 					pendingMessages.push({
 						role: "user",
 						content: [
 							{
 								type: "text",
-								text: "You have read enough files. Call `edit` on the most likely target file NOW. Do not read more files. One imperfect edit beats an empty diff.",
+								text: "Context gathered. Apply your first edit to the highest-priority target file now. A partial patch always outscores an empty diff.",
 							},
 						],
 						timestamp: Date.now(),
 					});
-					readsWithoutEdit = 0;
+					explorationCount = 0;
 				}
 
-				// v51b: panic edit — escalating urgency
-				// At 15s: first warning if no edit
-				// At 30s: second panic if still no edit
-				if (!hasEditedAnyFile && pendingMessages.length === 0) {
-					const elapsed = Date.now() - loopStartTime;
-					const filesList = filesReadPaths.size > 0
-						? `Files you have read: ${[...filesReadPaths].slice(0, 5).join(", ")}. `
+				if (!hasProducedEdit && pendingMessages.length === 0) {
+					const elapsed = Date.now() - loopStart;
+					const readList = pathsAlreadyRead.size > 0
+						? `Previously read: ${[...pathsAlreadyRead].slice(0, 5).join(", ")}. `
 						: "";
-					if (!panicEditInjected && elapsed >= PANIC_EDIT_MS) {
-						panicEditInjected = true;
+					if (!earlyNudgeSent && elapsed >= EARLY_NUDGE_MS) {
+						earlyNudgeSent = true;
 						pendingMessages.push({
 							role: "user",
 							content: [
 								{
 									type: "text",
-									text: `URGENT: ${Math.round(elapsed/1000)}s elapsed with ZERO edits. An empty diff scores 0. ${filesList}Call \`edit\` NOW on the most relevant file. Even 1 correct line beats 0.`,
+									text: `${Math.round(elapsed/1000)}s elapsed without any edits. An empty diff scores zero. ${readList}Apply \`edit\` to the most relevant file now. Even one correct change contributes to your score.`,
 								},
 							],
 							timestamp: Date.now(),
 						});
-					} else if (panicEditInjected && elapsed >= PANIC_EDIT_MS * 2 && !panicEditInjected2) {
-						panicEditInjected2 = true;
+					} else if (earlyNudgeSent && elapsed >= URGENT_NUDGE_MS && !urgentNudgeSent) {
+						urgentNudgeSent = true;
 						pendingMessages.push({
 							role: "user",
 							content: [
 								{
 									type: "text",
-									text: `FINAL WARNING: ${Math.round(elapsed/1000)}s elapsed, STILL no edits. You are about to be killed. ${filesList}Make ANY edit RIGHT NOW or score 0.`,
+									text: `${Math.round(elapsed/1000)}s in with zero file modifications. Time may be running out. ${readList}Make an edit immediately or accept a zero score.`,
 								},
 							],
 							timestamp: Date.now(),
@@ -472,24 +435,20 @@ async function runLoop(
 					}
 				}
 
-				// tau/sn66 v17: hard exit — stop gracefully before validator kills us.
-				// This ensures the container is still running when the diff is collected.
-				if ((Date.now() - loopStartTime) >= HARD_EXIT_MS) {
+				if ((Date.now() - loopStart) >= GRACEFUL_EXIT_MS) {
 					await emit({ type: "turn_end", message, toolResults });
 					await emit({ type: "agent_end", messages: newMessages });
 					return;
 				}
 
-				// tau/sn66 v17: time pressure — if we've been running for 80s
-				// without a single successful edit, inject urgency.
-				if (!hasEditedAnyFile && !timeWarningInjected && (Date.now() - loopStartTime) >= TIME_WARNING_MS && pendingMessages.length === 0) {
-					timeWarningInjected = true;
+				if (!hasProducedEdit && !finalNudgeSent && (Date.now() - loopStart) >= EARLY_NUDGE_MS && pendingMessages.length === 0) {
+					finalNudgeSent = true;
 					pendingMessages.push({
 						role: "user",
 						content: [
 							{
 								type: "text",
-								text: "TIME WARNING: you have been running for over 80 seconds without producing an edit. The validator will kill this process soon. You MUST call `edit` or `write` on a file RIGHT NOW or you will score 0. Pick the single most obvious target file from the task and edit it immediately. Do not read any more files.",
+								text: "Significant time elapsed with no file changes. Select the most obvious target from the task and apply your edit now. Further reading will not improve your score.",
 							},
 						],
 						timestamp: Date.now(),
