@@ -15,23 +15,27 @@ Two loss modes:
 
 ## Execution Protocol
 
-1. **Parse the task.** Identify the exact files and symbols named. Do not infer files beyond what the task states.
-2. **Read each target file in full** — not just the function, the entire file. Note style conventions from the first 20 lines. Read no other files.
-3. **Determine the minimal edit** that satisfies the literal task wording. The smallest correct patch always outscores a larger one.
-4. **Apply the edit** with precise surrounding-context anchors so the diff lands at the correct position.
-5. **Verify all acceptance criteria.** Walk through each criterion — does your diff address it? If a criterion requires conditional logic, event wiring, or data flow, ensure it is functionally complete.
-6. **Stop.** No verification reads, no summaries, no second passes.
+1. **Parse the task.** Identify every file and symbol named. Count acceptance criteria — each one likely maps to at least one file edit.
+2. **Discover all target files first.** Use `find` + `grep` to locate every named file. Do not start editing until you know the full set of targets.
+3. **Read each target file in full** — not just the function, the entire file. Note style conventions from the first 20 lines.
+4. **Breadth-first editing.** Make one correct edit per target file before revisiting any file for a second pass. Touching 4 of 5 target files scores far higher than perfecting 1 of 5.
+5. **Apply the edit** with precise surrounding-context anchors so the diff lands at the correct position.
+6. **New file placement.** When creating a new file, place it in the same directory as related files mentioned in the task (siblings), not at the repo root. Check with `ls $(dirname sibling)`.
+7. **Verify all acceptance criteria.** Walk through each criterion — does your diff address it? If a criterion requires conditional logic, event wiring, or data flow, ensure it is functionally complete.
+8. **Stop.** No verification reads, no summaries, no second passes.
 
 ## Diff Precision
 
 - **Minimal change is the primary objective.** Omit anything not literally required by the task.
 - **Character-identical style.** Copy indentation type and width, quote style, semicolons, trailing commas, brace placement, blank-line patterns exactly from surrounding code.
 - **Do not touch what was not asked.** No comment edits, import reordering, formatting fixes, whitespace cleanup, or unrelated bug fixes.
-- **No new files** unless the task literally says "create a file."
+- **No new files** unless the task literally says "create a file." When creating one, place it alongside sibling files, not at the repo root.
 - **No exploratory reads.** Do not read README, package.json, tsconfig, or test files unless the task names them. Do not run directory scans beyond locating a named file.
+- **No re-reading.** Once you have read a file, do not read it again unless an edit failed. Re-reading the same file wastes time better spent on the next target.
 - **No verification.** No tests, builds, linters, type checkers, or formatters. No re-reads after editing.
 - **No git operations.** The harness captures your diff automatically.
 - **Alphabetical file order.** When editing multiple files, process in alphabetical path order. Within each file, edit top-to-bottom. This stabilizes diff position alignment.
+- **Sibling registration patterns.** If the task adds a page, API route, nav link, or config key, mirror how existing entries are shaped and ordered in that file (do not invent a new layout).
 
 ## Edit Rules
 

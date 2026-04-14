@@ -6,22 +6,40 @@ import { execSync } from "node:child_process";
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.js";
 import { formatSkillsForPrompt, type Skill } from "./skills.js";
 
+function countAcceptanceCriteria(taskText: string): number {
+	const criteriaSection = taskText.match(/(?:acceptance\s+criteria|requirements):?\s*\n([\s\S]*?)(?:\n\n|\n(?=[A-Z])|\n(?=##)|$)/i);
+	if (!criteriaSection) return 0;
+	const bullets = criteriaSection[1].match(/^\s*[-*•]\s+/gm);
+	return bullets ? bullets.length : 0;
+}
+
+function extractNamedFiles(taskText: string): string[] {
+	const filePatterns = taskText.match(/`([^`]+\.[a-zA-Z]{1,6})`/g) || [];
+	return [...new Set(filePatterns.map(f => f.replace(/`/g, '')))];
+}
+
 function grepTaskKeywords(cwd: string, taskText: string): string {
 	try {
 		const backtickMatches = taskText.match(/`([^`]{2,60})`/g)?.map(k => k.replace(/`/g, '')) || [];
 		const camelMatches = taskText.match(/\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b/g) || [];
 		const snakeMatches = taskText.match(/\b[a-z]+_[a-z_]+\b/g) || [];
-		const allKeywords = [...new Set([...backtickMatches, ...camelMatches, ...snakeMatches])]
-			.filter(k => k.length >= 3 && k.length <= 60)
+		const kebabMatches = taskText.match(/\b[a-z][a-z0-9]*(?:-[a-z0-9]+)+\b/g) || [];
+		const pathLikeMatches =
+			taskText.match(/(?:\/|\b)(?:[\w.-]+\/)+[\w.-]+\b/g)?.map((p) => p.replace(/^\//, "").trim()) || [];
+		const allKeywords = [...new Set([...backtickMatches, ...camelMatches, ...snakeMatches, ...kebabMatches, ...pathLikeMatches])]
+			.filter(k => k.length >= 3 && k.length <= 80)
+			.filter(k => !/["'`]/.test(k))
 			.filter(k => !['the', 'and', 'for', 'with', 'that', 'this', 'from', 'should', 'must', 'when', 'each', 'into', 'also'].includes(k.toLowerCase()))
-			.slice(0, 10);
+			.slice(0, 12);
 		if (allKeywords.length === 0) return "";
 		const fileHits = new Map<string, string[]>();
+		const includeGlobs =
+			'--include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" --include="*.mjs" --include="*.cjs" --include="*.py" --include="*.go" --include="*.java" --include="*.kt" --include="*.dart" --include="*.rb" --include="*.cs" --include="*.vue" --include="*.css" --include="*.scss" --include="*.html" --include="*.json" --include="*.md"';
 		for (const keyword of allKeywords) {
 			try {
 				const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 				const result = execSync(
-					`grep -rl "${escaped}" --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" --include="*.py" --include="*.go" --include="*.java" --include="*.kt" --include="*.dart" --include="*.rb" --include="*.cs" --include="*.vue" . 2>/dev/null | grep -v node_modules | grep -v .git | grep -v dist/ | grep -v build/ | head -10`,
+					`grep -rl "${escaped}" ${includeGlobs} . 2>/dev/null | grep -v node_modules | grep -v .git | grep -v dist/ | grep -v build/ | head -10`,
 					{ cwd, timeout: 3000, encoding: "utf-8" }
 				).trim();
 				if (result) {
@@ -33,13 +51,36 @@ function grepTaskKeywords(cwd: string, taskText: string): string {
 				}
 			} catch {}
 		}
-		if (fileHits.size === 0) return "";
 		const sorted = [...fileHits.entries()].sort((a, b) => b[1].length - a[1].length).slice(0, 15);
-		let result = "\n\n## Pre-identified target files\n\nThese files reference identifiers from the task description. Prioritize these:\n";
-		for (const [file, keywords] of sorted) {
-			result += `- ${file} (${keywords.join(", ")})\n`;
+
+		const criteriaCount = countAcceptanceCriteria(taskText);
+		const namedFiles = extractNamedFiles(taskText);
+
+		let result = "";
+		if (criteriaCount > 0 || namedFiles.length > 0) {
+			result += "\n\n## Task scope analysis\n\n";
+			if (criteriaCount > 0) {
+				result += `This task has **${criteriaCount} acceptance criteria**. `;
+				if (criteriaCount >= 3) {
+					result += `Tasks with ${criteriaCount}+ criteria almost always require edits across multiple files. Do NOT stop after editing one file.\n`;
+				} else {
+					result += "\n";
+				}
+			}
+			if (namedFiles.length > 0) {
+				result += `Files explicitly named in the task: ${namedFiles.map(f => `\`${f}\``).join(", ")}. Each named file likely needs an edit.\n`;
+			}
 		}
-		return result + "\n";
+
+		if (fileHits.size > 0) {
+			result += "\n## Pre-identified target files\n\nThese files reference identifiers from the task description. Prioritize these:\n";
+			for (const [file, keywords] of sorted) {
+				result += `- ${file} (${keywords.join(", ")})\n`;
+			}
+			result += "\n";
+		}
+
+		return result;
 	} catch {}
 	return "";
 }
@@ -82,13 +123,23 @@ Your edits must replicate ALL style conventions character-for-character.
 - Implement exactly what the task requests — nothing more, nothing less.
 - The narrowest correct change always outscores a broader one.
 - Use \`edit\` for existing files. \`write\` only for files the task explicitly asks to create.
+- **New file placement:** When creating a new file, place it alongside related files. If the task mentions \`foo.py\` and sibling files live in \`src/utils/\`, write to \`src/utils/foo.py\` — not the repo root. Run \`ls\` on the sibling directory if unsure.
 - Short oldText anchors (3-5 lines). On failure, re-read the file first.
 - Alphabetical file order; top-to-bottom within each file.
 - Append new imports, list items, and enum values at the end of existing blocks.
 - Copy string literals from the task verbatim.
 - Do not refactor, reorder imports, add comments/docstrings, or fix unrelated code.
+- New routes, menu entries, or feature flags: match how siblings are declared (same object shape, ordering pattern, trailing commas).
 
-## Phase 4: Criteria Verification
+## Phase 4: Breadth-first file coverage
+
+**CRITICAL: Edit ALL relevant files before perfecting any single file.**
+- Make one correct edit per target file before going back for a second pass on any file.
+- If the task names N files, your diff should touch N files. Touching 3 of 5 files scores much higher than perfecting 1 of 5.
+- Do not re-read a file you already read unless a prior edit failed. Re-reading wastes time.
+- After each successful edit, immediately move to the NEXT unedited target file.
+
+## Phase 5: Criteria Verification
 
 Walk through each acceptance criterion:
 - Does each one have a corresponding working edit?
@@ -98,7 +149,7 @@ Walk through each acceptance criterion:
 - Named files in the task must all be edited.
 - 4+ criteria typically span 2+ files. Do not stop early.
 
-## Phase 5: Stop
+## Phase 6: Stop
 
 All criteria addressed — stop. No re-reads, no cleanup, no summaries. The harness reads your diff from disk.
 

@@ -176,20 +176,24 @@ async function runLoop(
 	let hasProducedEdit = false;
 	let emptyTurnRetries = 0;
 	const EMPTY_TURN_MAX = 2;
-	const EXPLORE_CEILING = 2;
 
 	const loopStart = Date.now();
 	let earlyNudgeSent = false;
 	let urgentNudgeSent = false;
 	let finalNudgeSent = false;
 	const pathsAlreadyRead = new Set<string>();
+	const pathReadCounts = new Map<string, number>();
+	let rereadNudgeSent = false;
+	const editedPaths = new Set<string>();
 
 	let workPhase: "search" | "absorb" | "apply" = "search";
 	let foundFiles: string[] = [];
 	let absorbedFiles = new Set<string>();
 	const EARLY_NUDGE_MS = 10_000;
-	const URGENT_NUDGE_MS = 20_000;
+	const URGENT_NUDGE_MS = 22_000;
+	const LATE_NUDGE_MS = 55_000;
 	const GRACEFUL_EXIT_MS = 170_000;
+	let multiFileHintSent = false;
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
@@ -312,18 +316,43 @@ async function runLoop(
 					} else {
 						editFailMap.set(targetPath, 0);
 						priorFailedAnchor.delete(targetPath);
+						const firstEdit = !hasProducedEdit;
 						hasProducedEdit = true;
 						explorationCount = 0;
+						editedPaths.add(targetPath);
+						const uneditedTargets = foundFiles.filter(
+							(f: string) => !editedPaths.has(f) && !editedPaths.has("./" + f) && !editedPaths.has(f.replace(/^\.\//, ""))
+						);
+						const breadthHint = uneditedTargets.length > 0
+							? ` There are still ${uneditedTargets.length} discovered target file(s) you have not edited: ${uneditedTargets.slice(0, 5).map((f: string) => `\`${f}\``).join(", ")}. Continue with the next file.`
+							: "";
 						pendingMessages.push({
 							role: "user",
 							content: [
 								{
 									type: "text",
-									text: `\`${targetPath}\` updated successfully. Your prior view of this file is now outdated — use \`read\` before making further edits to it. Does this change fully satisfy the relevant acceptance criterion?`,
+									text: `\`${targetPath}\` updated successfully.${breadthHint} Does this change fully satisfy the relevant acceptance criterion?`,
 								},
 							],
 							timestamp: Date.now(),
 						});
+						if (
+							firstEdit &&
+							!multiFileHintSent &&
+							(foundFiles.length >= 4 || pathsAlreadyRead.size >= 4)
+						) {
+							multiFileHintSent = true;
+							pendingMessages.push({
+								role: "user",
+								content: [
+									{
+										type: "text",
+										text: "You touched several candidate paths. If any acceptance criterion still maps to a file you have not edited, continue there before stopping — ties favor complete coverage.",
+									},
+								],
+								timestamp: Date.now(),
+							});
+						}
 					}
 				}
 
@@ -385,17 +414,43 @@ async function runLoop(
 					}
 					if (tr.toolName === "read" && !tr.isError && tc && tc.type === "toolCall") {
 						const readPath = (tc.arguments as any)?.path;
-						if (readPath && typeof readPath === "string") pathsAlreadyRead.add(readPath);
+						if (readPath && typeof readPath === "string") {
+							pathsAlreadyRead.add(readPath);
+							pathReadCounts.set(readPath, (pathReadCounts.get(readPath) ?? 0) + 1);
+						}
 					}
 				}
 
-				if (!hasProducedEdit && explorationCount >= EXPLORE_CEILING && pendingMessages.length === 0) {
+				if (!rereadNudgeSent && pendingMessages.length === 0) {
+					for (const [rp, cnt] of pathReadCounts) {
+						if (cnt >= 4) {
+							rereadNudgeSent = true;
+							const others = foundFiles.filter(
+								(f: string) => !editedPaths.has(f) && f !== rp && !f.endsWith("/" + rp) && !rp.endsWith("/" + f)
+							);
+							pendingMessages.push({
+								role: "user",
+								content: [
+									{
+										type: "text",
+										text: `You have read \`${rp}\` ${cnt} times. Stop re-reading it. ${others.length > 0 ? `Move to a different file you have not edited yet: ${others.slice(0, 4).map((f: string) => `\`${f}\``).join(", ")}.` : "Apply \`edit\` now or move on."}`,
+									},
+								],
+								timestamp: Date.now(),
+							});
+							break;
+						}
+					}
+				}
+
+				const dynamicExploreCeiling = Math.max(3, Math.min(foundFiles.length + 1, 8));
+				if (!hasProducedEdit && explorationCount >= dynamicExploreCeiling && pendingMessages.length === 0) {
 					pendingMessages.push({
 						role: "user",
 						content: [
 							{
 								type: "text",
-								text: "Context gathered. Apply your first edit to the highest-priority target file now. A partial patch always outscores an empty diff.",
+								text: `Context gathered (${explorationCount} reads/bashes). Apply your first edit to the highest-priority target file now. A partial patch always outscores an empty diff.`,
 							},
 						],
 						timestamp: Date.now(),
@@ -441,14 +496,19 @@ async function runLoop(
 					return;
 				}
 
-				if (!hasProducedEdit && !finalNudgeSent && (Date.now() - loopStart) >= EARLY_NUDGE_MS && pendingMessages.length === 0) {
+				if (
+					!hasProducedEdit &&
+					!finalNudgeSent &&
+					(Date.now() - loopStart) >= LATE_NUDGE_MS &&
+					pendingMessages.length === 0
+				) {
 					finalNudgeSent = true;
 					pendingMessages.push({
 						role: "user",
 						content: [
 							{
 								type: "text",
-								text: "Significant time elapsed with no file changes. Select the most obvious target from the task and apply your edit now. Further reading will not improve your score.",
+								text: "Over 50s without edits. Pick the clearest file from the task or keyword list and apply \`edit\` now — further discovery has diminishing returns.",
 							},
 						],
 						timestamp: Date.now(),
